@@ -1,0 +1,36 @@
+# ============================================================
+# CI Pipeline - ws-ms-analytics
+# ============================================================
+# This pipeline is triggered when a Pull Request is created
+# into dev or main. It calls the shared CI template from
+# ms-CICD-template to validate branch policy and commit
+# message format.
+#
+# Branch flow: feat* -> dev -> main
+#   - dev  accepts PRs only from feat* branches
+#   - main accepts PRs only from dev
+# ============================================================
+
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+      - dev
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: ms-CICD-template
+      ref: main
+
+stages:
+  - stage: CI
+    displayName: 'Continuous Integration'
+    jobs:
+      - template: 01_cicd_pipelines/continuous_integration.yml@templates
+        parameters:
+          poolName: 'JMAN'
+          servicePrincipalVariableGroup: 'servicePrincipalVariableGroup'

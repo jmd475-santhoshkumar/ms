@@ -1,0 +1,33 @@
+# ============================================================
+# CD Pipeline - ws-ms-landing
+# ============================================================
+# This pipeline is triggered when a PR is merged (push to
+# dev or main). It calls the shared CD template from
+# ms-CICD-template to deploy changes to the corresponding
+# Fabric workspace (dev -> DEV, main -> PROD).
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - dev
+
+pr: none
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: ms-CICD-template
+      ref: main
+
+stages:
+  - stage: CD
+    displayName: 'Continuous Deployment'
+    jobs:
+      - template: 01_cicd_pipelines/continuous_deployment.yml@templates
+        parameters:
+          poolName: 'JMAN'
+          workspaceVariableGroup: 'ws-ms-landing'
+          servicePrincipalVariableGroup: 'servicePrincipalVariableGroup'

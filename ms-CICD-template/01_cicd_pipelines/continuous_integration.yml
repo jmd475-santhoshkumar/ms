@@ -1,0 +1,224 @@
+parameters:
+  - name: poolName
+    type: string
+    default: 'JMAN'
+
+  - name: servicePrincipalVariableGroup
+    type: string
+
+jobs:
+
+  # ========================================
+  # Job 1: Branch Validation
+  # ========================================
+  - job: branch_validation
+    displayName: 'Validate PR Source and Target Branch'
+    pool:
+      name: ${{ parameters.poolName }}
+    steps:
+      - checkout: none
+
+      - powershell: |
+          Write-Host "======================================"
+          Write-Host "PR BRANCH POLICY VALIDATION"
+          Write-Host "======================================"
+          Write-Host "Pipeline Start Time: $(Build.BuildId)"
+          Write-Host ""
+
+          # Raw values
+          $target_branch_raw = "$(System.PullRequest.TargetBranch)"
+          $source_branch_raw = "$(System.PullRequest.SourceBranch)"
+
+          Write-Host "RAW Target Branch : '$target_branch_raw'"
+          Write-Host "RAW Source Branch : '$source_branch_raw'"
+
+          # Handle non-PR case
+          if (-not $target_branch_raw -or -not $source_branch_raw) {
+              Write-Host "[WARNING] Not a PR build. Skipping validation."
+              exit 0
+          }
+
+          # Clean values
+          $target_branch = $target_branch_raw.Replace("refs/heads/", "").Trim().ToLower()
+          $source_branch = $source_branch_raw.Replace("refs/heads/", "").Trim().ToLower()
+
+          Write-Host "Processed Target  : '$target_branch'"
+          Write-Host "Processed Source  : '$source_branch'"
+          Write-Host ""
+
+          $isValid = $false
+          $validationRule = ""
+
+          # ========================================
+          # Branch Validation Rules
+          # ========================================
+          # Media Sense promotion flow: feat* -> dev -> main
+          # Any branch starting with 'feat' (feat, feat-xyz, feat/xyz) is a
+          # feature branch, so repos with multiple feat branches need no change.
+
+          # Rule 1: dev accepts only feat* branches
+          if ($target_branch -eq "dev") {
+              Write-Host "[Rule 1] dev branch validation:"
+              if ($source_branch -like "feat*") {
+                  Write-Host "[PASS] Source branch '$source_branch' is a valid feature branch for dev"
+                  $isValid = $true
+                  $validationRule = "dev accepts only feat* branches"
+              } else {
+                  Write-Host "##vso[task.logissue type=error][FAIL] dev accepts PRs only from feat* branches"
+                  Write-Host "Actual source: $source_branch"
+                  $validationRule = "FAILED: Invalid source branch"
+              }
+          }
+
+          # Rule 2: main accepts only dev (prod)
+          elseif ($target_branch -eq "main") {
+              Write-Host "[Rule 2] main branch validation:"
+              if ($source_branch -eq "dev") {
+                  Write-Host "[PASS] Source branch 'dev' is valid for main"
+                  $isValid = $true
+                  $validationRule = "main accepts only dev"
+              } else {
+                  Write-Host "##vso[task.logissue type=error][FAIL] main accepts PRs only from dev"
+                  Write-Host "Actual source: $source_branch"
+                  $validationRule = "FAILED: Invalid source branch"
+              }
+          }
+
+          else {
+              Write-Host "##vso[task.logissue type=error][FAIL] Target branch '$target_branch' is not a valid PR target. Only 'dev' and 'main' accept pull requests."
+              $validationRule = "FAILED: Unconfigured target branch"
+          }
+
+          Write-Host ""
+          Write-Host "Validation Rule Applied: $validationRule"
+          Write-Host "======================================"
+
+          # ========================================
+          # Final Decision
+          # ========================================
+          if ($isValid) {
+              Write-Host "[PASS] PR BRANCH POLICY VALIDATION PASSED"
+              Write-Host "##vso[task.setvariable variable=BranchValidationResult;isOutput=true]PASSED"
+              Write-Host "##vso[task.setvariable variable=SourceBranch;isOutput=true]$source_branch"
+              Write-Host "##vso[task.setvariable variable=TargetBranch;isOutput=true]$target_branch"
+          } else {
+              Write-Host "[FAIL] PR BRANCH POLICY VALIDATION FAILED"
+              Write-Host "##vso[task.complete result=Failed;]Validation failed"
+              Write-Host "##vso[task.setvariable variable=BranchValidationResult;isOutput=true]FAILED"
+              exit 1
+          }
+        name: validateBranchPolicy
+
+  # ========================================
+  # Job 2: Commit Message Validation
+  # ========================================
+  - job: commit_message_validation
+    displayName: 'Validate Commit Message'
+    dependsOn: branch_validation
+    condition: succeeded()
+    pool:
+      name: ${{ parameters.poolName }}
+    steps:
+      - checkout: self
+        fetchDepth: 0
+
+      - powershell: |
+          Write-Host "======================================"
+          Write-Host "COMMIT MESSAGE VALIDATION"
+          Write-Host "======================================"
+          Write-Host ""
+
+          # In PR builds, Azure DevOps creates a merge commit.
+          # We need the latest commit from the PR source branch, not the merge commit.
+          $sourceCommitId = "$(System.PullRequest.SourceCommitId)"
+
+          if ([string]::IsNullOrWhiteSpace($sourceCommitId)) {
+              Write-Host "[WARNING] Not a PR build. Falling back to HEAD commit."
+              $commitMessage = git log -1 --pretty=%s
+          } else {
+              Write-Host "PR Source Commit ID: $sourceCommitId"
+              $commitMessage = git log -1 --pretty=%s $sourceCommitId
+          }
+
+          $commitMessage = $commitMessage.Trim()
+          $allowedPrefixes = @{
+              "feat"     = "New feature"
+              "fix"      = "Bug fix"
+              "refactor" = "Code change without feature/bug impact"
+              "hotfix"   = "Urgent production fix"
+          }
+
+          # Check if commit message starts with an allowed prefix
+          $isValid = $false
+          $matchedPrefix = ""
+
+          foreach ($prefix in $allowedPrefixes.Keys) {
+              if ($commitMessage -match "^$prefix(\s|:|-)") {
+                  $isValid = $true
+                  $matchedPrefix = $prefix
+                  break
+              }
+          }
+
+          if ($isValid) {
+              Write-Host "[PASS] Commit message starts with valid prefix: '$matchedPrefix' ($($allowedPrefixes[$matchedPrefix]))"
+              Write-Host "##vso[task.setvariable variable=CommitValidationResult;isOutput=true]PASSED"
+          } else {
+              Write-Host "##vso[task.logissue type=error][FAIL] Commit message does not start with a valid prefix."
+              Write-Host ""
+              Write-Host "Allowed prefixes:"
+              foreach ($prefix in $allowedPrefixes.Keys) {
+                  Write-Host "  - $prefix : $($allowedPrefixes[$prefix])"
+              }
+              Write-Host ""
+              Write-Host "Examples:"
+              Write-Host "  feat: add new dashboard report"
+              Write-Host "  fix: resolve null reference in pipeline"
+              Write-Host "  refactor: simplify data transformation logic"
+              Write-Host "  hotfix: patch critical auth issue"
+              Write-Host ""
+              Write-Host "##vso[task.complete result=Failed;]Commit message validation failed"
+              Write-Host "##vso[task.setvariable variable=CommitValidationResult;isOutput=true]FAILED"
+              exit 1
+          }
+        name: validateCommitMessage
+        displayName: 'Validate Commit Message Format'
+
+  # # ========================================
+  # # Job 3: Connection Permission Validation
+  # # ========================================
+  # # Shift-left check: confirm the deployment service principal has a usable role
+  # # on every Fabric connection referenced by the repo items, so a missing
+  # # connection permission fails the PR instead of only failing later in CD.
+  # ========================================
+  # Job 4: Validation Summary
+  # ========================================
+  - job: validation_summary
+    displayName: 'Validation Summary'
+    dependsOn:
+      - branch_validation
+      - commit_message_validation
+    condition: succeeded()
+    pool:
+      name: ${{ parameters.poolName }}
+    variables:
+      branchValidationResult: $[ dependencies.branch_validation.outputs['validateBranchPolicy.BranchValidationResult'] ]
+      sourceBranch: $[ dependencies.branch_validation.outputs['validateBranchPolicy.SourceBranch'] ]
+      targetBranch: $[ dependencies.branch_validation.outputs['validateBranchPolicy.TargetBranch'] ]
+      commitValidationResult: $[ dependencies.commit_message_validation.outputs['validateCommitMessage.CommitValidationResult'] ]
+    steps:
+      - checkout: none
+
+      - powershell: |
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "CI PIPELINE SUMMARY"
+          Write-Host "======================================"
+          Write-Host "Branch Validation     : $(branchValidationResult)"
+          Write-Host "Commit Validation     : $(commitValidationResult)"
+          Write-Host "Source Branch         : $(sourceBranch)"
+          Write-Host "Target Branch         : $(targetBranch)"
+          Write-Host "Status                : READY FOR DEPLOYMENT"
+          Write-Host "======================================"
+          Write-Host ""
+        displayName: 'Display CI Summary'

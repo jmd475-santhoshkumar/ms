@@ -1,0 +1,306 @@
+parameters:
+  - name: poolName
+    type: string
+    default: "JMAN"
+
+  - name: workspaceVariableGroup
+    type: string
+
+  - name: servicePrincipalVariableGroup
+    type: string
+
+
+jobs:
+
+
+  # This job validates the variable group passed to the pipeline for the workspace details.
+  - job: workspace_variable_group_validation
+    pool:
+      name: ${{ parameters.poolName }}
+    variables:
+      - group: ${{ parameters.workspaceVariableGroup }}
+    steps:
+      - checkout: none
+      - powershell: |
+          Write-Host "Validating if the correct Variable Group is passed for the Repo..."
+
+          $workspace_variable_group = "${{ parameters.workspaceVariableGroup }}"
+          $source_repo = "$(Build.Repository.Name)"
+
+          if ($workspace_variable_group -like "$source_repo*") {
+            Write-Host "OK Correct Variable Group '$workspace_variable_group' is passed for the repository '$source_repo'"
+          } else {
+            Write-Host "FAILED Incorrect Variable Group '$workspace_variable_group' is passed for the repository '$source_repo'"
+            Write-Host "Expected Variable Group name to exactly match the repository name '$source_repo'"
+            Write-Host "##vso[task.complete result=Failed;]Variable Group validation failed"
+            exit 1
+          }
+        name: validate_workspace_variable_group
+
+
+  # This job identifies the branch from which the PR is raised or the branch to which the commit is made and maps it to the corresponding workspace details using the variable group.
+  - job: branch_identification
+    pool:
+      name: ${{ parameters.poolName }}
+    dependsOn: workspace_variable_group_validation
+    variables:
+      - group: ${{ parameters.workspaceVariableGroup }}
+    steps:
+      - checkout: none
+      - powershell: |
+          Write-Host "Identifying Current Branch..."
+
+          $current_branch = "$(Build.SourceBranch)".Replace("refs/heads/", "")
+          Write-Host "Current Branch: $current_branch"
+
+          # Map Branches to the workspaceId from the variable group
+          $workspace_id = ""
+          $workspace_name = ""
+          $environment = ""
+
+          switch($current_branch){
+            "dev" {
+              Write-Host "OK Current branch '$current_branch' is identified as DEV environment"
+              $workspace_id = "$(DEV_WORKSPACE_ID)"
+              $workspace_name = "$(DEV_WORKSPACE_NAME)"
+              $environment = "DEV"
+              }
+            "main" {
+                Write-Host "OK Current branch '$current_branch' is identified as PROD environment"
+                $workspace_id = "$(PROD_WORKSPACE_ID)"
+                $workspace_name = "$(PROD_WORKSPACE_NAME)"
+                $environment = "PROD"
+              }
+            default {
+                Write-Host "FAILED Current branch '$current_branch' is not recognized for deployment"
+                Write-Host "##vso[task.complete result=Failed;]Branch identification failed"
+                exit 1
+              }
+            }
+
+          Write-Host "Workspace ID: $workspace_id"
+          Write-Host "Workspace Name: $workspace_name"
+          Write-Host "Environment: $environment"
+
+          Write-Host "##vso[task.setvariable variable=workspaceId;isOutput=true]$workspace_id"
+          Write-Host "##vso[task.setvariable variable=workspaceName;isOutput=true]$workspace_name"
+          Write-Host "##vso[task.setvariable variable=environment;isOutput=true]$environment"
+        name: setWorkspaceDetails
+
+
+  # # This job validates the workspace by running the workspace validation script.
+  # - job: workspace_validation
+  #   pool:
+  #     name: ${{ parameters.poolName }}
+  #   dependsOn:
+  #     - branch_identification
+  #   variables:
+  #     - group: ${{ parameters.servicePrincipalVariableGroup }}
+  #     - name: workspaceId
+  #       value: $[ dependencies.branch_identification.outputs['setWorkspaceDetails.workspaceId'] ]
+  #     - name: workspaceName
+  #       value: $[ dependencies.branch_identification.outputs['setWorkspaceDetails.workspaceName'] ]
+  #   steps:
+  #     - checkout: "git://<ado-project>/ms-CICD-template@main"
+  #       path: cicd_templates
+
+  #     - powershell: |
+  #         Write-Host "======================================"
+  #         Write-Host "WORKSPACE VALIDATION"
+  #         Write-Host "======================================"
+  #         Write-Host "Workspace ID   : $(workspaceId)"
+  #         Write-Host "Workspace Name : $(workspaceName)"
+  #         Write-Host ""
+
+  #         $scripts_dir = "$(Pipeline.Workspace)\cicd_templates\02_workspace_validation_script"
+
+  #         Write-Host "--- Python setup ---"
+  #         py -3.11 --version
+  #         py -3.11 -m pip install --upgrade pip --quiet
+  #         py -3.11 -m pip install requests --quiet
+  #         Write-Host "OK Dependencies installed"
+  #         Write-Host ""
+
+  #         Write-Host "--- Running workspace validation script ---"
+  #         py -3.11 "$scripts_dir\workspace_validation.py" `
+  #           --workspace_id "$(workspaceId)" `
+  #           --workspace_name "$(workspaceName)"
+
+  #         if ($LASTEXITCODE -ne 0) {
+  #             Write-Host "##vso[task.logissue type=error]Workspace validation failed with exit code $LASTEXITCODE"
+  #             exit 1
+  #         }
+
+  #         Write-Host "OK Workspace validation passed"
+  #         Write-Host "======================================"
+  #       displayName: 'Run Workspace Validation Script'
+  #       env:
+  #         AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+  #         AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+  #         AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+  #       name: validate_workspace
+
+
+  # This job displays the deployment details like workspace name, workspace id and environment which are identified and validated in the previous steps.
+  - job: display_deployment_details
+    pool:
+      name: ${{ parameters.poolName }}
+    dependsOn:
+      - branch_identification
+    variables:
+      - name: workspaceId
+        value: $[ dependencies.branch_identification.outputs['setWorkspaceDetails.workspaceId'] ]
+      - name: environment
+        value: $[ dependencies.branch_identification.outputs['setWorkspaceDetails.environment'] ]
+      - name: workspaceName
+        value: $[ dependencies.branch_identification.outputs['setWorkspaceDetails.workspaceName'] ]
+    steps:
+      - checkout: none
+      - powershell: |
+          Write-Host "Deployment Details:"
+          Write-Host "Workspace ID: $(workspaceId)"
+          Write-Host "Workspace Name: $(workspaceName)"
+          Write-Host "Environment: $(environment)"
+        name: display_details
+
+
+  # This job deploys the changes to the fabric workspace using the deployment scripts present in the repository.
+  - job: deploy_to_fabric_workspace
+    pool:
+      name: ${{ parameters.poolName }}
+    dependsOn:
+      - branch_identification
+      - display_deployment_details
+    variables:
+      - group: ${{ parameters.servicePrincipalVariableGroup }}
+      - name: workspaceId
+        value: $[ dependencies.branch_identification.outputs['setWorkspaceDetails.workspaceId'] ]
+      - name: environment
+        value: $[ dependencies.branch_identification.outputs['setWorkspaceDetails.environment'] ]
+      - name: workspaceName
+        value: $[ dependencies.branch_identification.outputs['setWorkspaceDetails.workspaceName'] ]
+    steps:
+      - powershell: |
+          Write-Host "Setting PowerShell execution policy to Bypass..."
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          Write-Host "OK Execution policy set successfully"
+        displayName: "Fix PowerShell Execution Policy"
+
+      # Checkout the source repo (the data repo, e.g. ws-ms-analytics) - contains Fabric items and deployment scripts
+      - checkout: self
+
+      - powershell: |
+          Write-Host "======================================"
+          Write-Host "FABRIC WORKSPACE DEPLOYMENT"
+          Write-Host "======================================"
+          Write-Host "Timestamp        : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          Write-Host "Agent            : $(Agent.Name)"
+          Write-Host "Build ID         : $(Build.BuildId)"
+          Write-Host ""
+
+          $repo_dir     = "$(Build.SourcesDirectory)"
+          $scripts_dir  = "$(Build.SourcesDirectory)\02_deployment_scripts"
+          $workspace_id = "$(workspaceId)"
+          $environment  = "$(environment)"
+
+          Write-Host "Environment      : $environment"
+          Write-Host "Workspace ID     : $workspace_id"
+          Write-Host "Workspace Name   : $(workspaceName)"
+          Write-Host "Repo Directory   : $repo_dir"
+          Write-Host "Scripts Dir      : $scripts_dir"
+          Write-Host ""
+
+          Write-Host "--- Validating inputs ---"
+          if ([string]::IsNullOrWhiteSpace($workspace_id)) {
+              Write-Host "##vso[task.logissue type=error]Workspace ID is empty. Cannot proceed with deployment."
+              exit 1
+          }
+          Write-Host "  Workspace ID   : OK"
+
+          if (-Not (Test-Path -Path $repo_dir)) {
+              Write-Host "##vso[task.logissue type=error]Repository directory '$repo_dir' does not exist."
+              exit 1
+          }
+          Write-Host "  Repo directory : OK"
+
+          if (-Not (Test-Path -Path $scripts_dir)) {
+              Write-Host "##vso[task.logissue type=error]Scripts directory '$scripts_dir' does not exist."
+              exit 1
+          }
+          Write-Host "  Scripts dir    : OK"
+          Write-Host ""
+
+          Write-Host "===== DEBUG ====="
+
+          Write-Host "PATH:"
+          $env:PATH
+
+          Write-Host "Python exists:"
+          Test-Path "C:\Program Files\Python312\python.exe"
+
+          Write-Host "Run Python directly:"
+          & "C:\Program Files\Python312\python.exe" --version
+
+          Write-Host "Run pip:"
+          & "C:\Program Files\Python312\python.exe" -m pip --version
+
+          Write-Host "Exit Code: $LASTEXITCODE"
+
+          Write-Host "===== END DEBUG ====="
+
+          Write-Host "--- Python setup ---"
+          $PythonExe = "C:\Program Files\Python312\python.exe"
+
+          Write-Host "===== Python Debug ====="
+          where.exe python
+          where.exe py
+
+          python --version
+          py -0p
+
+          Get-Command python
+          Get-Command py
+
+          $env:PATH
+
+          Write-Host "========================"
+
+          & $PythonExe --version
+          Write-Host "Upgrading pip..."
+          & $PythonExe -m pip install --upgrade pip
+          Write-Host ""
+          Write-Host "Installing dependencies..."
+          & $PythonExe -m pip install -r "$scripts_dir\requirements.txt"
+          Write-Host "OK Dependencies installed"
+          Write-Host ""
+
+          Write-Host "--- Running deployment script ---"
+          Write-Host "  --repo_dir     $repo_dir"
+          Write-Host "  --workspace_id $workspace_id"
+          Write-Host "  --environment  $environment"
+          Write-Host ""
+
+          & $PythonExe "$scripts_dir\deploy.py" `
+            --repo_dir $repo_dir `
+            --workspace_id $workspace_id `
+            --environment $environment
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "##vso[task.logissue type=error]Deployment failed with exit code $LASTEXITCODE"
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "DEPLOYMENT SUCCESS"
+          Write-Host "  Environment    : $environment"
+          Write-Host "  Workspace      : $workspace_id"
+          Write-Host "  Completed at   : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          Write-Host "======================================"
+
+        displayName: 'Run Fabric Workspace Deployment Script'
+        env:
+          AZURE_CLIENT_ID: $(AZURE_CLIENT_ID)
+          AZURE_CLIENT_SECRET: $(AZURE_CLIENT_SECRET)
+          AZURE_TENANT_ID: $(AZURE_TENANT_ID)
+        name: deploy_fabric_workspace
